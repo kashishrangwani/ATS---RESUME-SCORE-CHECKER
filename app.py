@@ -7,6 +7,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 from fpdf import FPDF
 import matplotlib.pyplot as plt
 from PyPDF2 import PdfReader
+import joblib
+
+# ---------- LOAD TRAINED ML ARTIFACTS ----------
+# Ensure these files exist: resume_model.pkl and tfidf_vectorizer.pkl
+model = joblib.load("resume_model.pkl")
+vectorizer = joblib.load("tfidf_vectorizer.pkl")
 
 # ---------------------------
 # Default Skills
@@ -21,6 +27,8 @@ DEFAULT_SKILLS = [
 # Helper Functions
 # ---------------------------
 def clean_text(text):
+    if not text:
+        return ""
     text = text.lower()
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -37,8 +45,8 @@ def compute_skill_score(resume_text, jd_text, skills_list):
     return score, matched, missing
 
 def compute_keyword_similarity(resume_text, jd_text):
-    vectorizer = TfidfVectorizer()
-    vectors = vectorizer.fit_transform([resume_text, jd_text])
+    vectorizer_local = TfidfVectorizer()
+    vectors = vectorizer_local.fit_transform([resume_text, jd_text])
     sim = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
     return sim
 
@@ -47,6 +55,31 @@ def compute_education_score(resume_text, jd_text):
 
 def compute_resume_quality(resume_text):
     return 1.0, {'contact_present': True, 'bullets': resume_text.count('-')}
+
+# ---------- ML helper functions ----------
+def ml_predict_label(text):
+    """Return predicted class label for given text."""
+    if not text:
+        return "Unknown"
+    X = vectorizer.transform([text])
+    pred = model.predict(X)[0]
+    return pred
+
+def ml_predict_proba(text):
+    """Return probability of predicted class (0..1). If model doesn't support proba, return None."""
+    if not text:
+        return None
+    X = vectorizer.transform([text])
+    try:
+        probs = model.predict_proba(X)[0]
+        # get probability for predicted class
+        classes = model.classes_
+        pred = model.predict(X)[0]
+        # find index
+        idx = list(classes).index(pred)
+        return float(probs[idx])
+    except Exception:
+        return None
 
 # PDF Report Class
 class PDFReport(FPDF):
@@ -102,7 +135,7 @@ def run_single_resume_page():
             try:
                 reader = PdfReader(uploaded_file)
                 resume_text = ' '.join([page.extract_text() for page in reader.pages if page.extract_text()])
-            except:
+            except Exception:
                 st.error('Error reading PDF')
         if not resume_text and resume_text_manual:
             resume_text = resume_text_manual
@@ -113,11 +146,16 @@ def run_single_resume_page():
         if not resume_text or not jd_text:
             st.error('Please provide both Resume and Job Description')
         else:
+            # compute existing scores
             skill_score_val, matched_skills, missing_skills = compute_skill_score(resume_text,jd_text,skills_list)
             keyword_sim = compute_keyword_similarity(resume_text,jd_text)
             education_score_val, _, _ = compute_education_score(resume_text,jd_text)
             resume_quality_val, quality_checks = compute_resume_quality(resume_text)
             final_score = (0.4*skill_score_val + 0.3*keyword_sim + 0.1*education_score_val + 0.2*resume_quality_val)*100
+
+            # ML prediction
+            ml_label = ml_predict_label(resume_text)
+            ml_prob = ml_predict_proba(resume_text)
 
             # Dashboard layout
             left_col, right_col = st.columns([1,1.2])
@@ -164,10 +202,17 @@ def run_single_resume_page():
             st.markdown("<h3 style='color:#0b3d91;'>Overall Score</h3>", unsafe_allow_html=True)
             st.metric('Final ATS Score', f'{round(final_score,2)} / 100')
 
+            # ML display
+            st.subheader("🤖 ML Model Prediction")
+            if ml_prob is not None:
+                st.write(f"**Predicted category:** {ml_label} (confidence: {ml_prob*100:.1f}%)")
+            else:
+                st.write(f"**Predicted category:** {ml_label}")
+
             # PDF download
             pdf = PDFReport(title='ATS Resume Analysis')
             data = {
-                'summary': f'ATS Score: {round(final_score,2)} / 100',
+                'summary': f'ATS Score: {round(final_score,2)} / 100\\nML Prediction: {ml_label}',
                 'scores': {'Skills': skill_score_val*100, 'Keywords': keyword_sim*100,
                            'Education': education_score_val*100, 'Resume Quality': resume_quality_val*100},
                 'matched_skills': matched_skills,
@@ -177,7 +222,6 @@ def run_single_resume_page():
             pdf.build(data)
             pdf_bytes = pdf.output(dest='S').encode('latin-1')
             st.download_button('Download PDF', data=pdf_bytes, file_name='ATS_Report.pdf')
-
 
 def run_bulk_analysis_page():
     st.title('📂 Bulk Resume Analysis')
@@ -191,8 +235,11 @@ def run_bulk_analysis_page():
         jd_text_clean = clean_text(jd_text)
 
         for file in uploaded_files:
-            reader = PdfReader(file)
-            resume_text = ' '.join([page.extract_text() for page in reader.pages if page.extract_text()])
+            try:
+                reader = PdfReader(file)
+                resume_text = ' '.join([page.extract_text() for page in reader.pages if page.extract_text()])
+            except Exception:
+                resume_text = ""
             resume_text_clean = clean_text(resume_text)
 
             skill_score, matched, missing = compute_skill_score(resume_text_clean, jd_text_clean, DEFAULT_SKILLS)
@@ -201,11 +248,18 @@ def run_bulk_analysis_page():
             resume_quality, _ = compute_resume_quality(resume_text_clean)
             final_score = (0.4*skill_score + 0.3*keyword_sim + 0.1*education_score + 0.2*resume_quality)*100
 
+            # ML prediction for each resume
+            ml_label = ml_predict_label(resume_text_clean)
+            ml_prob = ml_predict_proba(resume_text_clean)
+            ml_prob_pct = round(ml_prob*100,1) if ml_prob is not None else None
+
             results.append({
                 "Resume": file.name,
                 "Final Score": round(final_score,2),
                 "Skills Matched": len(matched),
-                "Keywords Similarity": round(keyword_sim*100,2)
+                "Keywords Similarity": round(keyword_sim*100,2),
+                "ML Label": ml_label,
+                "ML Prob (%)": ml_prob_pct
             })
 
         df_results = pd.DataFrame(results)
@@ -213,10 +267,9 @@ def run_bulk_analysis_page():
         st.dataframe(df_results)
         st.bar_chart(df_results.set_index('Resume')['Final Score'])
 
-        # Download Excel report
+        # Download Excel report (includes ML columns)
         df_results.to_excel('comparative_analysis.xlsx', index=False)
         st.download_button('Download Comparative Report', data=open('comparative_analysis.xlsx','rb'), file_name='Comparative_Report.xlsx')
-
 
 # ---------------------------
 # Main Navigation
