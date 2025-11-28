@@ -1,9 +1,0 @@
-streamlit
-scikit-learn
-PyPDF2
-sentence-transformers
-numpy
-pandas
-fpdf
-matplotlib
-pyspellchecker
